@@ -3,7 +3,7 @@
 DSC 106 Project 3: an interactive D3 explorer of how wildfires spread across the western US,
 built from NOAA GOES fire detections, July 13 to August 31, 2026.
 
-- `index.html` is the spread explorer: one zoomable map of every fire pixel, a timeline and a side panel.
+- `index.html` is the spread explorer: one zoomable map of every fire pixel with a timeline under it.
 - `explore.html` holds the six exploratory graphs from the checkpoint ("Graph 1" to "Graph 6" below).
 
 ## Using the explorer
@@ -11,12 +11,10 @@ built from NOAA GOES fire detections, July 13 to August 31, 2026.
 | To do this | Do this |
 | --- | --- |
 | Zoom and pan | Scroll or pinch, drag, the + / − buttons, or the + and − keys |
-| Move through time | Drag in the timeline, press Space to play, arrow keys step an hour (Shift: a day) |
-| Zoom into a span of days | Drag across the strip under the timeline |
-| Focus on one fire | Click its outline, its origin marker or its row in the list. Esc goes back |
-| Chart any area | Select area, then drag a box on the map (or Shift-drag) |
-| Change what colour means | Power now, Arrival date or Hours burned (keys 1, 2, 3) |
-| Share a view | Copy the URL; the selection, time and view are stored in it |
+| Move through time | Press play or Space, drag in the timeline, arrow keys step an hour (Shift: a day) |
+| Follow one fire | Click its name marker, its area on the map, or its dot on the timeline. Esc goes back |
+| Change what colour means | Burning now (heat of each pixel) or Spread by date (when fire first reached it) |
+| Share a view | Copy the URL; the fire, time and view are stored in it |
 
 ## View the page
 
@@ -28,7 +26,9 @@ python3 -m http.server 8000
 ```
 
 VS Code Live Server also works. D3 v7 is the only plotting library, and it loads from a CDN.
-`data/fires.json`, `data/pixels.json`, `data/context.json` and `data/states.geojson` are already built, so viewing the page needs no Python.
+`data/fires.json`, `data/pixels.json` and `data/states.geojson` are already built, so viewing the page needs no Python.
+The map background (`data/basemap.jpg`, `data/basemap-wide.jpg`) is NASA Blue Marble shaded relief, saved once from the
+[GIBS](https://nasa-gibs.github.io/gibs-api-docs/) WMS endpoint in Web Mercator.
 
 ## The data
 
@@ -110,10 +110,7 @@ python scripts/extract_fdc.py --sat 18 --start 2026-07-13T00 --end 2026-09-01T00
 python scripts/build_fires.py --detections data/raw/detections \
     --perimeters data/perimeters.geojson --out data/fires.json
 
-# 3. Outlines of every perimeter for the explorer map. Writes data/context.json
-python scripts/build_context.py
-
-# 4. Only if the basemap is missing: western state outlines from us-atlas
+# 3. Only if the basemap is missing: western state outlines from us-atlas
 curl -sSL -o states-10m.json https://cdn.jsdelivr.net/npm/us-atlas@3.0.1/states-10m.json
 python scripts/build_states.py states-10m.json --out data/states.geojson
 ```
@@ -174,14 +171,13 @@ dsc106-project-3/
 ├── data/
 │   ├── fires.json             hourly series and spread runs (graphs 2, 4, 5, 6)
 │   ├── pixels.json            fire pixels by solar hour (graphs 1 and 3)
-│   ├── context.json           simplified outline of all 43 perimeters (explorer map)
+│   ├── basemap*.jpg           NASA Blue Marble relief behind the explorer map
 │   ├── states.geojson         western state outlines for the maps
 │   ├── perimeters.geojson     NIFC perimeters (input to the build)
 │   └── raw/                   detection CSVs (gitignored)
 ├── scripts/
 │   ├── extract_fdc.py         S3 -> detections CSV
 │   ├── build_fires.py         detections CSV -> fires.json, pixels.json
-│   ├── build_context.py       perimeters.geojson -> context.json
 │   └── build_states.py        us-atlas TopoJSON -> states.geojson
 └── requirements.txt
 ```

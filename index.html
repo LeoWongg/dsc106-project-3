@@ -14,140 +14,50 @@
   <main>
     <header>
       <p class="eyebrow">DSC 106 &middot; Project 3 &middot; NOAA GOES-18 fire detections</p>
-      <h1>How did the West's wildfires spread, hour by hour?</h1>
-      <p class="lede">Every square is one satellite pixel, about 2 by 3 km, where GOES-18 saw fire between <span id="period">July 13 and August 31, 2026</span>. Detections seen only once in two hours are dropped as false alarms. Five-minute scans are averaged into hours of local solar time. Power for cloud-flagged pixels is estimated from their neighbours.</p>
+      <h1>Fifty days of fire across the West, hour by hour</h1>
+      <p class="lede">Each glowing square is a patch of ground, about 2 by 3 km, where a weather satellite saw fire in that hour, <span id="period">July 13 to August 31, 2026</span>. Press play to watch the summer burn, then click a fire to follow it from its first spark.</p>
     </header>
 
-    <div class="moments" role="group" aria-label="Guided starting points">
-      <span class="moments-label">Start here</span>
-      <div class="moments-buttons" id="moments"></div>
-      <p class="moment-caption" id="moment-caption" aria-live="polite"></p>
-    </div>
-
-    <div class="app">
-      <section class="stage" aria-label="Map of fire pixels">
-        <div class="stage-bar">
-          <div class="control">
-            <span class="control-label">Colour by</span>
-            <div class="segmented" id="view-toggle" role="radiogroup" aria-label="What colour shows on the map">
-              <button type="button" role="radio" data-view="power" aria-checked="true" title="Fire radiative power of pixels burning now (key 1)">Power now</button>
-              <button type="button" role="radio" data-view="arrival" aria-checked="false" title="When each pixel first burned (key 2)">Arrival date</button>
-              <button type="button" role="radio" data-view="duration" aria-checked="false" title="How many hours each pixel has burned so far (key 3)">Hours burned</button>
-            </div>
-          </div>
-          <div class="control">
-            <span class="control-label">Afterglow</span>
-            <div class="segmented" id="trail-toggle" role="radiogroup" aria-label="How long recently burning pixels stay visible">
-              <button type="button" role="radio" data-trail="0" aria-checked="false">Off</button>
-              <button type="button" role="radio" data-trail="6" aria-checked="true">6 h</button>
-              <button type="button" role="radio" data-trail="24" aria-checked="false">24 h</button>
-            </div>
-          </div>
-          <button type="button" class="chip" id="select-area" aria-pressed="false" title="Draw a box on the map to chart only that area. Shift-drag also works.">Select area</button>
+    <section class="stage" aria-label="Map and timeline of fire detections">
+      <div class="map-wrap" id="map">
+        <div class="clock">
+          <div class="clock-date" id="clock-date"></div>
+          <div class="clock-sub" id="clock-sub"></div>
         </div>
 
-        <div class="map-wrap" id="map">
-          <div class="clock" aria-live="off">
-            <div class="clock-date" id="clock-date"></div>
-            <div class="clock-sub" id="clock-sub"></div>
+        <div class="map-controls">
+          <div class="segmented" id="view-toggle" role="radiogroup" aria-label="What the map shows">
+            <button type="button" role="radio" data-view="power" aria-checked="true" title="Fire burning in this hour, coloured by how much heat it gives off">Burning now</button>
+            <button type="button" role="radio" data-view="arrival" aria-checked="false" title="All ground burned so far, coloured by the date fire first reached it">Spread by date</button>
           </div>
           <div class="zoom-buttons" role="group" aria-label="Map zoom">
             <button type="button" id="zoom-in" aria-label="Zoom in">+</button>
             <button type="button" id="zoom-out" aria-label="Zoom out">&minus;</button>
-            <button type="button" id="zoom-home" aria-label="Reset the map to the whole West" title="Whole West">
+            <button type="button" id="zoom-home" aria-label="Show the whole West" title="Whole West">
               <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
             </button>
           </div>
-          <div class="map-legend" id="map-legend"></div>
-          <div class="map-hint" id="map-hint">Scroll to zoom &middot; drag to pan &middot; click a fire &middot; Space to play</div>
         </div>
-      </section>
 
-      <aside class="panel" aria-label="Details for the current selection">
-        <section class="panel-block readout">
-          <div class="scope-row">
-            <h2 id="scope-name">All West</h2>
-            <button type="button" class="chip" id="scope-clear" hidden>Back to all West</button>
-          </div>
-          <p class="scope-sub" id="scope-sub"></p>
-          <dl class="stats">
-            <div><dt>Pixels burning</dt><dd id="stat-n">0</dd></div>
-            <div><dt>New ground</dt><dd id="stat-fresh">0</dd></div>
-            <div><dt>Power</dt><dd id="stat-power">0</dd></div>
-          </dl>
-        </section>
+        <aside class="fire-card" id="fire-card" hidden aria-live="polite">
+          <h2 id="fire-name"></h2>
+          <p id="fire-facts"></p>
+          <p class="fire-reach" id="fire-reach"></p>
+          <button type="button" class="chip" id="scope-clear">&larr; All fires</button>
+        </aside>
 
-        <section class="panel-block">
-          <div class="block-head">
-            <h3>Largest single-origin fires</h3>
-            <label class="field">Sort
-              <select id="fire-sort" aria-label="Sort fires by">
-                <option value="acres">Acres</option>
-                <option value="peak">Peak power</option>
-                <option value="fastest">Fastest 6 h run</option>
-                <option value="start">Start date</option>
-              </select>
-            </label>
-          </div>
-          <div class="fire-list" id="fire-list" role="list"></div>
-        </section>
-
-        <section class="panel-block">
-          <div class="block-head">
-            <h3>Time of day</h3>
-            <span class="block-note" id="tod-note"></span>
-          </div>
-          <div id="tod" class="chart"></div>
-          <div class="legend small">
-            <span><i class="swatch swatch-power"></i>Measured power</span>
-            <span><i class="swatch swatch-nopower"></i>No measured power</span>
-          </div>
-        </section>
-
-        <section class="panel-block" id="reach-block">
-          <div class="block-head">
-            <h3>Distance from origin</h3>
-            <span class="block-note" id="reach-note"></span>
-          </div>
-          <div id="reach" class="chart"></div>
-          <p class="hint" id="reach-empty">Choose a fire to see how far it ran from where it started.</p>
-        </section>
-      </aside>
-    </div>
-
-    <section class="card timeline" aria-label="Timeline">
-      <div class="timeline-tools">
-        <div class="transport">
-          <button type="button" class="play" id="play" aria-label="Play" aria-pressed="false">
-            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path class="icon-play" d="M4 2.5v11l9-5.5z"/><path class="icon-pause" d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/></svg>
-          </button>
-          <div class="segmented" id="speed-toggle" role="radiogroup" aria-label="Playback speed in hours per second">
-            <button type="button" role="radio" data-speed="6" aria-checked="false">6 h/s</button>
-            <button type="button" role="radio" data-speed="24" aria-checked="true">24 h/s</button>
-            <button type="button" role="radio" data-speed="96" aria-checked="false">96 h/s</button>
-          </div>
-        </div>
-        <div class="control">
-          <span class="control-label">Chart</span>
-          <div class="segmented" id="measure-toggle" role="radiogroup" aria-label="Measure on the timeline">
-            <button type="button" role="radio" data-measure="power" aria-checked="true">Power</button>
-            <button type="button" role="radio" data-measure="pixels" aria-checked="false">Pixels burning</button>
-            <button type="button" role="radio" data-measure="fresh" aria-checked="false">New ground</button>
-          </div>
-          <div class="segmented" id="mode-toggle" role="radiogroup" aria-label="Power estimate">
-            <button type="button" role="radio" data-mode="filled" aria-checked="true">Gap-filled</button>
-            <button type="button" role="radio" data-mode="reported" aria-checked="false">Reported only</button>
-          </div>
-        </div>
-        <div class="presets">
-          <button type="button" class="chip" id="win-busiest">Busiest 3 days</button>
-          <button type="button" class="chip" id="win-reset">Full period</button>
-        </div>
+        <div class="map-legend" id="map-legend"></div>
       </div>
-      <p class="sub" id="timeline-title"></p>
-      <div id="timeline" class="chart"></div>
-      <p class="hint">Drag in the chart to move the time. Drag across the lower strip to zoom into a span of days; the map's arrival colours rescale to that span. Arrow keys step one hour, Shift + arrow one day.</p>
+
+      <div class="timebar">
+        <button type="button" class="play" id="play" aria-label="Play" aria-pressed="false">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path class="icon-play" d="M4 2.5v11l9-5.5z"/><path class="icon-pause" d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/></svg>
+        </button>
+        <div id="timeline" class="chart"></div>
+      </div>
     </section>
+
+    <p class="hint how">Scroll to zoom &middot; drag to pan &middot; click a named fire to follow it &middot; drag the timeline or press Space to play &middot; hover anything for details</p>
 
     <footer class="note" id="method-note"></footer>
 

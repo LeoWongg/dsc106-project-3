@@ -1,25 +1,20 @@
-/* Spread explorer: one zoomable map of GOES fire pixels, a timeline and a side panel,
-   all driven by one state object.
+/* Spread explorer: one zoomable map of GOES fire pixels with a timeline underneath.
 
-   S.scope    what the charts describe: {type:"all"}, {type:"fire", id} or {type:"region", geo:[[lon,lat],[lon,lat]]}
-   S.window   [startHour, endHour) set by the timeline brush, or null for the full period
-   S.hour     solar hour index shown on the map
-   S.view     map colour: "power", "arrival" or "duration"
-   S.measure  timeline measure: "power", "pixels" or "fresh"
-   S.mode     "filled" or "reported" power
-   S.trail    afterglow length in hours (0, 6 or 24)
+   S.fire   id of the fire being followed, or null for the whole West
+   S.hour   solar hour index shown on the map
+   S.view   "power" (what burns now, coloured by heat) or "arrival" (all burned ground, coloured by date)
 
-   The map always draws every pixel; scope only changes what the charts count. */
+   The time span on the timeline follows the selection: the whole period, or one fire's life. */
 
-const S = {
-  scope: { type: "all" }, window: null, hour: null, view: "power", measure: "power", mode: "filled",
-  trail: 6, sort: "acres", speed: 24, selecting: false, moment: null,
-};
+const S = { fire: null, hour: 0, view: "power" };
 const REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-const UNMEASURED = "#7d8a9c";
-const NOW_WHITE = "#ffffff";
-const BEFORE_WINDOW = "#6f6660";
-const MIN_WINDOW_HOURS = 6;
+const UNMEASURED = "#8fa0b8";
+const SCAR = "#050403";
+const TRAIL_HOURS = 12;        // recently burning pixels fade out over this long
+const PLAY_SECONDS = 45;       // a full play-through of the visible span
+// NASA Blue Marble shaded relief (EPSG:3857): a sharp tile over the study area and a wide, coarser one behind it.
+const BASEMAP = { href: "data/basemap.jpg", west: -128, east: -107, south: 33, north: 51 };
+const BASEMAP_WIDE = { href: "data/basemap-wide.jpg", west: -142, east: -93, south: 29, north: 54 };
 const CITIES = [
   ["Seattle", -122.33, 47.61, 1], ["Portland", -122.68, 45.52, 1], ["Spokane", -117.43, 47.66, 1],
   ["Boise", -116.2, 43.62, 1], ["Salt Lake City", -111.89, 40.76, 1], ["Reno", -119.81, 39.53, 1],
@@ -32,27 +27,17 @@ const CITIES = [
   ["Richfield", -112.08, 38.77, 3], ["Susanville", -120.65, 40.42, 3],
 ].map(([name, lon, lat, minK]) => ({ name, lon, lat, minK }));
 
-let context = [];
-let N, firstHour, pixHours, activeAt, firstByHour, maxDuration;
+let N, firstHour, pixHours, activeAt, firstByHour;
 let map, timeline, player;
 
-const fmtAcres = d3.format(".3s");
 const fmt1 = d3.format(".1f");
-const win = () => S.window || [0, totalHours];
-const clampHour = h => { const [a, b] = win(); return Math.max(a, Math.min(b - 1, h)); };
 const hourStamp = h => `${fmtDay(hourDate(h))}, ${fmtHour(hourDate(h))}`;
 const fmtPower = gw => (gw >= 1 ? `${fmtGW(gw)} GW` : `${fmtInt(gw * 1000)} MW`);
 const runById = id => runs.find(r => r.id === id);
+const selectedRun = () => (S.fire ? runById(S.fire) : null);
 const discoveryHour = run => (new Date(run.discovered) - new Date(meta.t0)) / HOUR_MS + run.origin[0] / 15;
 
-function windowLabel() {
-  const [a, b] = win();
-  const start = fmtDay(hourDate(a));
-  const end = fmtDay(hourDate(b - 1));
-  return start === end ? start : `${start} to ${end}`;
-}
-
-/* ---------- data indexes ---------- */
+/* ---------- data ---------- */
 
 function indexPixels() {
   N = pixelData.pos.length;
@@ -72,136 +57,90 @@ function indexPixels() {
   }
   firstByHour = d3.groups(d3.range(N).filter(i => firstHour[i] >= 0), i => firstHour[i])
     .map(([h, pix]) => ({ h, pix })).sort((a, b) => a.h - b.h);
-  maxDuration = d3.max(pixHours, a => a.length);
 }
 
-const hoursBurned = (i, h) => d3.bisectRight(pixHours[i], h);
-
-function scopeKey() {
-  const s = S.scope;
-  return s.type === "fire" ? `f:${s.id}` : s.type === "region" ? `r:${s.geo.flat().join(",")}` : "all";
-}
-
-function scopeName() {
-  const s = S.scope;
-  return s.type === "fire" ? runById(s.id).name : s.type === "region" ? "Selected area" : "All West";
-}
-
-function scopeKeep() {
-  const s = S.scope;
-  if (s.type === "fire") {
-    const k = pixelData.fireIndex.get(s.id);
-    return i => pixelData.pos[i].fire === k;
-  }
-  if (s.type === "region") {
-    const mask = map.regionMask();
-    return i => mask[i] === 1;
-  }
-  return null;
-}
-
-/* Hourly rows for the current scope. Pixel counts always come from the pixel table, so they match
-   the map. Power for All West and named fires is the per-scan average from the build; for a drawn
-   area it is rebuilt from the hourly pixel table, assuming 12 scans an hour. */
-let seriesCache = { key: null, hours: null };
+/* Hourly rows for the selection: power from the build (per-scan average), pixel counts from the
+   pixel table so they match what the map draws. */
+const seriesCache = new Map();
 function scopeSeries() {
-  const key = scopeKey();
-  if (seriesCache.key === key) return seriesCache.hours;
-  const keep = scopeKeep();
-  const exact = S.scope.type === "region" ? null : seriesById.get(S.scope.type === "fire" ? S.scope.id : "all").hours;
+  const key = S.fire || "all";
+  if (seriesCache.has(key)) return seriesCache.get(key);
+  const k = S.fire ? pixelData.fireIndex.get(S.fire) : null;
+  const exact = seriesById.get(key).hours;
   const hours = d3.range(totalHours).map(h => {
-    let n = 0, nPower = 0, fresh = 0, reported = 0, filled = 0;
-    for (const r of activeAt[h]) {
-      if (keep && !keep(r.i)) continue;
-      n++;
-      if (r.mw > 0) { nPower++; reported += r.mw * r.scans / 12; }
-      filled += Math.abs(r.mw) * r.scans / 12;
-      if (firstHour[r.i] === h) fresh++;
-    }
-    return {
-      i: h, date: hourDate(h), hod: h % 24, n, nPower, fresh, withFrp: nPower, noFrp: n - nPower,
-      reported: exact ? exact[h].reported : reported / 1000,
-      filled: exact ? exact[h].filled : filled / 1000,
-    };
+    let n = 0;
+    for (const r of activeAt[h]) if (k == null || pixelData.pos[r.i].fire === k) n++;
+    return { i: h, date: hourDate(h), hod: h % 24, n, filled: exact[h].filled, reported: exact[h].reported };
   });
-  seriesCache = { key, hours };
+  seriesCache.set(key, hours);
   return hours;
 }
 
-const rowsInWindow = () => { const [a, b] = win(); return scopeSeries().slice(a, b); };
-
-const MEASURES = {
-  power: {
-    label: () => `Fire radiative power in gigawatts, ${S.mode === "filled" ? "with cloud-flagged pixels estimated" : "reported values only"}`,
-    unit: "Gigawatts", value: d => d[S.mode], scaleValue: d => d.filled, fmt: fmtPower, curve: d3.curveMonotoneX,
-  },
-  pixels: {
-    label: () => "Satellite pixels seen burning in each hour",
-    unit: "Pixels", value: d => d.n, scaleValue: d => d.n, fmt: v => `${fmtInt(v)} pixels`, curve: d3.curveStepAfter,
-  },
-  fresh: {
-    label: () => "New ground: pixels burning for the first time, per hour",
-    unit: "New pixels", value: d => d.fresh, scaleValue: d => d.fresh, fmt: v => `${fmtInt(v)} new pixels`, curve: d3.curveStepAfter,
-  },
-};
+/* Hours shown on the timeline: everything, or one fire from just before its first spark to its last detection. */
+function win() {
+  const run = selectedRun();
+  if (!run) return [0, totalHours];
+  if (!run.span) {
+    const rows = scopeSeries();
+    const first = rows.findIndex(d => d.n > 0);
+    const last = rows.length - 1 - [...rows].reverse().findIndex(d => d.n > 0);
+    const start = Math.min(first < 0 ? totalHours : first, Math.floor(discoveryHour(run)));
+    run.span = [Math.max(0, start - 6), Math.min(totalHours, Math.max(last, start + 48) + 12)];
+  }
+  return run.span;
+}
+const clampHour = h => { const [a, b] = win(); return Math.max(a, Math.min(b - 1, h)); };
 
 /* ---------- colour ---------- */
 
-const fireRamp = d3.interpolateRgbBasis(["#7a1408", "#c8321a", "#f0701c", "#ffb52e", "#fff3b0"]);
+const fireRamp = d3.interpolateRgbBasis(["#b3260f", "#e8501a", "#ff8a1f", "#ffc23d", "#fff6c4"]);
 const powerScale = d3.scaleSequentialLog([40, 2500], fireRamp).clamp(true);
-const arrivalRamp = t => d3.interpolateViridis(0.2 + 0.8 * t);
-const durationRamp = t => d3.interpolateInferno(0.3 + 0.7 * t);
+const arrivalRamp = t => d3.interpolateViridis(0.22 + 0.78 * t);
 let arrivalScale = d3.scaleSequential([0, 1], arrivalRamp).clamp(true);
-let durationScale = d3.scaleSequentialLog([1, 100], durationRamp).clamp(true);
 
-function arrivalColor(h) {
-  return h < win()[0] ? BEFORE_WINDOW : arrivalScale(h);
+/* Date range for the arrival colours: when the selection's ground first burned, cut at the 95th
+   percentile so a few late pixels do not flatten the days when the fire actually ran. */
+function arrivalDomain() {
+  const k = S.fire ? pixelData.fireIndex.get(S.fire) : null;
+  const hours = [];
+  for (let i = 0; i < N; i++) if (firstHour[i] >= 0 && (k == null || pixelData.pos[i].fire === k)) hours.push(firstHour[i]);
+  hours.sort(d3.ascending);
+  if (!hours.length) return [0, 1];
+  const lo = hours[0];
+  return [lo, Math.max(lo + 24, d3.quantileSorted(hours, S.fire ? 0.95 : 1))];
 }
-
-function rampCss(scale, ramp) {
-  return `linear-gradient(to right, ${d3.range(0, 1.001, 0.1).map(ramp).join(",")})`;
-}
+const rampCss = ramp => `linear-gradient(to right, ${d3.range(0, 1.001, 0.1).map(ramp).join(",")})`;
 
 function drawLegend() {
-  const el = d3.select("#map-legend");
-  const key = (cls, color, text) => `<span><i class="${cls}" style="${color ? `background:${color}` : ""}"></i>${text}</span>`;
+  const key = (color, text) => `<span><i style="background:${color}"></i>${text}</span>`;
   let title, ramp, ticks, keys;
   if (S.view === "power") {
-    title = "Fire radiative power of each burning pixel";
-    ramp = rampCss(powerScale, fireRamp);
-    ticks = [[0, "40 MW"], ...[150, 600].map(v => [(Math.log(v) - Math.log(40)) / (Math.log(2500) - Math.log(40)), fmtInt(v)]), [1, "2,500+"]];
-    keys = key("", UNMEASURED, "Burning, no measured power") + key("", "var(--scar)", "Burned earlier");
-  } else if (S.view === "arrival") {
-    const [a, b] = win();
-    title = "Date each pixel first burned";
-    ramp = rampCss(arrivalScale, arrivalRamp);
-    ticks = [[0, fmtDay(hourDate(a))], [0.5, fmtDay(hourDate(Math.floor((a + b) / 2)))], [1, fmtDay(hourDate(b - 1))]];
-    keys = key("", NOW_WHITE, "Burning now") + (a > 0 ? key("", BEFORE_WINDOW, `Before ${fmtDay(hourDate(a))}`) : "");
+    title = "Heat from each burning pixel";
+    ramp = rampCss(fireRamp);
+    ticks = ["40 MW", "300", "2,500+"];
+    keys = key(UNMEASURED, "Burning, heat hidden by cloud") + key(SCAR, "Already burned");
   } else {
-    title = "Hours each pixel has burned so far";
-    ramp = rampCss(durationScale, durationRamp);
-    const [lo, hi] = durationScale.domain();
-    ticks = [[0, "1 h"], [Math.log(10 / lo) / Math.log(hi / lo), "10"], [1, `${fmtInt(hi)}+ h`]];
-    keys = key("", NOW_WHITE, "Burning now");
+    const [a, b] = arrivalDomain();
+    title = "Date fire first reached each pixel";
+    ramp = rampCss(arrivalRamp);
+    ticks = [fmtDay(hourDate(a)), fmtDay(hourDate(Math.floor((a + b) / 2))), `${fmtDay(hourDate(b))}${S.fire ? " on" : ""}`];
+    keys = key("#fff", "Burning now");
   }
-  keys += key("outline", "", "Final fire perimeter") + key("ring", "", "Origin");
-  el.html(`<div class="lg-title">${title}</div><div class="lg-ramp" style="background:${ramp}"></div>` +
-    `<div class="lg-ticks">${ticks.map(([t, label]) => `<span style="left:${(t * 100).toFixed(1)}%">${label}</span>`).join("")}</div>` +
-    `<div class="lg-keys">${keys}</div><div class="lg-note" id="lg-note"></div>`);
-  if (map) map.updateNote();
+  d3.select("#map-legend").html(`<div class="lg-title">${title}</div><div class="lg-ramp" style="background:${ramp}"></div>` +
+    `<div class="lg-ticks">${ticks.map(t => `<span>${t}</span>`).join("")}</div><div class="lg-keys">${keys}</div>`);
 }
 
 /* ---------- map ---------- */
 
 function destination([lon, lat], bearingDeg, km) {
-  const R = 6371, d = km / R, br = bearingDeg * Math.PI / 180;
+  const d = km / 6371, br = bearingDeg * Math.PI / 180;
   const p1 = lat * Math.PI / 180, l1 = lon * Math.PI / 180;
   const p2 = Math.asin(Math.sin(p1) * Math.cos(d) + Math.cos(p1) * Math.sin(d) * Math.cos(br));
   const l2 = l1 + Math.atan2(Math.sin(br) * Math.sin(d) * Math.cos(p1), Math.cos(d) - Math.sin(p1) * Math.sin(p2));
   return [l2 * 180 / Math.PI, p2 * 180 / Math.PI];
 }
 
-/* Farthest connected point of a fire at the end of solar hour h: [km, bearing] or null. */
+/* Farthest connected point of a fire at the end of solar hour h: [hours, km, bearing, merged] or null. */
 function reachAt(run, h) {
   const t = h + 1 - discoveryHour(run);
   const i = d3.bisector(p => p[0]).right(run.pts, t) - 1;
@@ -211,19 +150,21 @@ function reachAt(run, h) {
 function createMap() {
   const wrap = d3.select("#map");
   const svg = wrap.insert("svg", ":first-child").attr("role", "img")
-    .attr("aria-label", "Zoomable map of the western United States showing satellite fire pixels at the selected hour");
+    .attr("aria-label", "Zoomable map of the western United States showing where the satellite saw fire in the selected hour");
   const zoomG = svg.append("g");
+  const imageWide = zoomG.append("image").attr("href", BASEMAP_WIDE.href).attr("preserveAspectRatio", "none");
+  const image = zoomG.append("image").attr("href", BASEMAP.href).attr("preserveAspectRatio", "none");
+  const shade = zoomG.append("rect").attr("class", "m-shade");
+  const outside = zoomG.append("path").attr("class", "m-outside").attr("fill-rule", "evenodd");
+  const studyEdge = zoomG.append("path").attr("class", "m-study");
   const statesG = zoomG.append("g");
-  const studyPath = zoomG.append("path").attr("class", "m-study");
   const scarG = zoomG.append("g").attr("class", "m-pixels m-scar");
-  const durG = zoomG.append("g").attr("class", "m-pixels");
   const trailG = zoomG.append("g").attr("class", "m-pixels m-trail");
-  const activeG = zoomG.append("g").attr("class", "m-pixels");
+  const activeG = zoomG.append("g").attr("class", "m-pixels m-active");
   const perimG = zoomG.append("g");
   const reachRing = zoomG.append("path").attr("class", "m-reach");
   const reachLine = zoomG.append("line").attr("class", "m-reach-line");
   const hoverPath = zoomG.append("path").attr("class", "m-hover");
-  const boxRect = zoomG.append("rect").attr("class", "m-box").style("display", "none");
   const labelsG = svg.append("g").attr("class", "m-labels");
   const stateLabels = labelsG.append("g");
   const cityLabels = labelsG.append("g");
@@ -233,22 +174,17 @@ function createMap() {
   scaleBar.append("line");
   scaleBar.append("text");
 
-  let W = 0, H = 0, projection, path, kmPx = 1, pxBase = 1;
+  let W = 0, H = 0, projection, path, pxBase = 1;
   let t = d3.zoomIdentity;
   let cx, cy, dstr, quadtree;
   let scarNodes = [], scarHours = [], scarShown = [];
-  let durNodes = null, durCount = null;
-  let mask = null, maskKey = null;
-  let hoverId = null;
-  let nowSet = new Map();
+  let hoverId = null, nowSet = new Map(), reachXY = null;
 
-  const zoom = d3.zoom().scaleExtent([1, 48])
-    .filter(e => (!e.ctrlKey || e.type === "wheel") && !e.button && !e.shiftKey && !S.selecting)
+  const zoom = d3.zoom().scaleExtent([1, 32])
     .on("zoom", e => {
       t = e.transform;
       zoomG.attr("transform", t);
       onTransform();
-      if (e.sourceEvent) dismissHint();
     });
   svg.call(zoom).on("dblclick.zoom", null);
 
@@ -259,21 +195,34 @@ function createMap() {
     return [...edge(w, s, e, s), ...edge(e, s, e, n), ...edge(e, n, w, n), ...edge(w, n, w, s), [w, s]];
   }
 
+  /* Screen pixels per km at a latitude, before zoom (Mercator stretches with latitude). */
+  const kmPxAt = lat => projection.scale() / (6371 * Math.cos(lat * Math.PI / 180));
+
   function layout() {
     const node = wrap.node();
     W = Math.max(300, node.clientWidth);
     H = Math.max(300, node.clientHeight);
     svg.attr("viewBox", `0 0 ${W} ${H}`);
     const ring = studyRing();
-    projection = d3.geoConicConformal().parallels([38, 47]).rotate([117.5, 0])
-      .fitExtent([[18, 18], [W - 18, H - 18]], { type: "MultiPoint", coordinates: ring });
+    // Mercator, so the NASA basemap (EPSG:3857) lines up exactly.
+    projection = d3.geoMercator().fitExtent([[14, 14], [W - 14, H - 14]], { type: "MultiPoint", coordinates: ring });
     path = d3.geoPath(projection);
-    zoom.extent([[0, 0], [W, H]]).translateExtent([[-W * 0.4, -H * 0.15], [W * 1.4, H * 1.15]]);
+    zoom.extent([[0, 0], [W, H]]).translateExtent([[-W * 0.5, -H * 0.2], [W * 1.5, H * 1.2]]);
+    pxBase = kmPxAt(42) * 2.2;
 
-    const c = projection([-117.5, 42]);
-    const c2 = projection([-117.5 + 1 / (111.32 * Math.cos(42 * Math.PI / 180)), 42]);
-    kmPx = Math.hypot(c2[0] - c[0], c2[1] - c[1]);
-    pxBase = kmPx * 2.2;
+    const place = (el, b) => {
+      const [x0, y0] = projection([b.west, b.north]);
+      const [x1, y1] = projection([b.east, b.south]);
+      el.attr("x", x0).attr("y", y0).attr("width", x1 - x0).attr("height", y1 - y0);
+    };
+    place(imageWide, BASEMAP_WIDE);
+    place(image, BASEMAP);
+    place(shade, BASEMAP_WIDE);
+    const nw = projection([BASEMAP_WIDE.west, BASEMAP_WIDE.north]);
+    const se = projection([BASEMAP_WIDE.east, BASEMAP_WIDE.south]);
+    outside.attr("d", `M${nw[0]},${nw[1]}H${se[0]}V${se[1]}H${nw[0]}Z M` + ring.map(p => projection(p).map(v => v.toFixed(1)).join(",")).join("L") + "Z");
+
+    studyEdge.attr("d", path({ type: "LineString", coordinates: ring }));
 
     cx = new Float32Array(N);
     cy = new Float32Array(N);
@@ -287,32 +236,27 @@ function createMap() {
     quadtree = d3.quadtree().x(i => cx[i]).y(i => cy[i]).addAll(d3.range(N));
 
     statesG.selectAll("path").data(states.features).join("path").attr("class", "m-state").attr("d", path);
-    studyPath.attr("d", path({ type: "LineString", coordinates: ring }));
     stateLabels.selectAll("text").data(states.features).join("text").attr("class", "state-label")
       .attr("text-anchor", "middle").text(d => d.properties.name)
-      .each(function (d) { d.xy = path.centroid(d); });
+      .each(d => { d.xy = path.centroid(d); });
 
-    perimG.selectAll("path").data(context, d => d.name).join("path")
-      .attr("class", d => `m-perim${d.runId ? " named" : ""}`)
-      .attr("d", d => path(d.geo))
-      .each(function (d) { d.bounds = path.bounds(d.geo); d.xy = projection(d.origin); })
-      .each(d => {
-        // Put the name on the left when another named fire sits just to the right.
-        d.labelLeft = !!d.runId && context.some(o => o !== d && o.runId && projection(o.origin)[0] - d.xy[0] > 0
-          && projection(o.origin)[0] - d.xy[0] < 120 && Math.abs(projection(o.origin)[1] - d.xy[1]) < 14);
-      })
-      .on("click", (event, d) => {
-        if (d.runId) setScope(S.scope.type === "fire" && S.scope.id === d.runId ? { type: "all" } : { type: "fire", id: d.runId });
-        else flyTo(d.bounds);
-      });
+    for (const r of runs) {
+      r.xy = projection(r.origin);
+      r.bounds = path.bounds(r.perimeterGeo);
+    }
+    for (const r of runs) {
+      // Put the name on the left when another fire's marker sits just to the right.
+      r.labelLeft = runs.some(o => o !== r && o.xy[0] - r.xy[0] > 0 && o.xy[0] - r.xy[0] < 130 && Math.abs(o.xy[1] - r.xy[1]) < 14);
+    }
+    perimG.selectAll("path").data(runs, r => r.id).join("path").attr("class", "m-perim")
+      .attr("d", r => path(r.perimeterGeo))
+      .on("click", (event, r) => { if (S.fire !== r.id) setFire(r.id); });
 
     const scar = scarG.selectAll("path").data(firstByHour, d => d.h).join("path")
       .attr("d", d => d.pix.map(i => dstr[i]).join(""));
     scarNodes = scar.nodes();
     scarHours = firstByHour.map(d => d.h);
     scarShown = scarNodes.map(() => null);
-    durG.selectAll("path").remove();
-    durNodes = null;
 
     for (const city of CITIES) city.xy = projection([city.lon, city.lat]);
     cityLabels.selectAll("g").data(CITIES).join(enter => {
@@ -322,90 +266,75 @@ function createMap() {
       return g;
     });
 
-    fireLabels.selectAll("g").data(context, d => d.name).join(enter => {
-      const g = enter.append("g");
-      g.filter(d => d.runId).append("circle").attr("class", "origin").attr("r", 4)
-        .style("pointer-events", "all").style("cursor", "pointer")
-        .on("click", (event, d) => setScope({ type: "fire", id: d.runId }));
-      g.append("text").attr("class", d => `fire-label${d.runId ? "" : " minor"}`)
-        .attr("y", 4).text(d => d.name);
+    fireLabels.selectAll("g").data(runs, r => r.id).join(enter => {
+      const g = enter.append("g").attr("class", "fire");
+      g.append("circle").attr("class", "origin").attr("r", 4.5)
+        .on("click", (event, r) => setFire(S.fire === r.id ? null : r.id))
+        .on("pointerenter", (event, r) => highlight(r.id))
+        .on("pointerleave", () => highlight(null));
+      g.append("text").attr("class", "fire-label").attr("y", 4).text(r => r.name);
       return g;
     }).select("text")
-      .attr("x", d => (d.runId ? (d.labelLeft ? -8 : 8) : 0))
-      .attr("text-anchor", d => (d.runId ? (d.labelLeft ? "end" : "start") : "middle"));
+      .attr("x", r => (r.labelLeft ? -9 : 9)).attr("text-anchor", r => (r.labelLeft ? "end" : "start"));
 
-    mask = null;
-    paintScar();
-    drawRegion();
+    paint();
+    selectionChanged();
     svg.call(zoom.transform, targetTransform());
     renderHour();
   }
 
-  function boundsTransform([[x0, y0], [x1, y1]], maxK = 16, fill = 0.62) {
-    const k = Math.max(1, Math.min(maxK, fill / Math.max((x1 - x0) / W, (y1 - y0) / H)));
+  function targetTransform() {
+    const run = selectedRun();
+    if (!run) return d3.zoomIdentity;
+    const [[x0, y0], [x1, y1]] = run.bounds;
+    const k = Math.max(1, Math.min(14, 0.5 / Math.max((x1 - x0) / W, (y1 - y0) / H)));
     return d3.zoomIdentity.translate(W / 2, H / 2).scale(k).translate(-(x0 + x1) / 2, -(y0 + y1) / 2);
   }
 
-  function targetTransform() {
-    if (S.scope.type === "fire") {
-      const d = context.find(p => p.runId === S.scope.id);
-      if (d) return boundsTransform(d.bounds);
-    }
-    return S.scope.type === "region" ? t : d3.zoomIdentity;
+  function fly() {
+    svg.transition().duration(REDUCED_MOTION ? 0 : 1100).call(zoom.transform, targetTransform());
   }
 
-  function flyTo(bounds) {
-    const target = bounds ? boundsTransform(bounds) : targetTransform();
-    svg.transition().duration(REDUCED_MOTION ? 0 : 900).call(zoom.transform, target);
-  }
-
-  // Never below a hairline, so neighbouring pixels of one colour do not show seams.
+  // Pixels never shrink below a few screen pixels; the stroke supplies the padding. Never below a
+  // hairline, so neighbouring pixels of one colour do not show seams.
   const pad = minPx => Math.max(0.7, minPx - pxBase * t.k);
 
   function onTransform() {
-    scarG.attr("stroke-width", pad(2.6));
-    durG.attr("stroke-width", pad(3));
-    trailG.attr("stroke-width", pad(3.4));
-    activeG.attr("stroke-width", pad(4.4));
+    scarG.attr("stroke-width", pad(2.4));
+    trailG.attr("stroke-width", pad(3));
+    activeG.attr("stroke-width", pad(3.6));
     stateLabels.selectAll("text").attr("transform", d => `translate(${t.apply(d.xy)})`)
-      .style("display", t.k < 3.2 ? null : "none");
+      .style("display", t.k < 3 ? null : "none");
+    // A city name gives way when a fire's name would sit on top of it.
+    const fireXY = runs.map(r => t.apply(r.xy));
     cityLabels.selectAll("g").attr("transform", d => `translate(${t.apply(d.xy)})`)
-      .style("display", d => (t.k >= d.minK ? null : "none"));
-    fireLabels.selectAll("g").attr("transform", d => `translate(${t.apply(d.xy)})`)
-      .style("display", d => (d.runId || t.k >= 2.4 ? null : "none"));
+      .style("display", d => {
+        const [x, y] = t.apply(d.xy);
+        const clash = fireXY.some(f => Math.abs(f[1] - y) < 13 && x - f[0] > -70 && x - f[0] < 130);
+        return t.k >= d.minK && !clash ? null : "none";
+      });
+    fireLabels.selectAll("g").attr("transform", r => `translate(${t.apply(r.xy)})`);
     placeReachLabel();
-    const km = d3.least([2, 5, 10, 20, 50, 100, 200, 500], k => Math.abs(k * kmPx * t.k - 90));
-    const len = km * kmPx * t.k;
-    scaleBar.attr("transform", `translate(${W - 16 - len},${H - 18})`);
+    const centre = projection.invert(t.invert([W / 2, H / 2]));
+    const kmPx = kmPxAt(centre[1]) * t.k;
+    const km = d3.least([2, 5, 10, 20, 50, 100, 200, 500], k => Math.abs(k * kmPx - 90));
+    const len = km * kmPx;
+    const right = S.fire ? 334 : 16; // clear of the fire card
+    scaleBar.attr("transform", `translate(${Math.max(290, W - right - len)},${H - 18})`);
     scaleBar.select("line").attr("x1", 0).attr("x2", len);
     scaleBar.select("text").attr("x", len).attr("y", -6).attr("text-anchor", "end").text(`${km} km`);
-    updateNote();
   }
 
-  function updateNote() {
-    const el = document.getElementById("lg-note");
-    if (el) el.textContent = pad(4.4) > 1 ? "Pixels are drawn larger than life at this zoom. Zoom in for true footprints." : "Pixels are at true ground size.";
-  }
-
-  function paintScar() {
-    const [a, b] = win();
-    arrivalScale = d3.scaleSequential([a, Math.max(a + 1, b - 1)], arrivalRamp).clamp(true);
+  /* Colours that depend on the view or the time span, not on the hour. */
+  function paint() {
+    arrivalScale = d3.scaleSequential(arrivalDomain(), arrivalRamp).clamp(true);
+    const byDate = S.view === "arrival";
     for (let k = 0; k < scarNodes.length; k++) {
-      scarNodes[k].style.color = S.view === "arrival" ? arrivalColor(scarHours[k]) : "";
+      scarNodes[k].style.color = byDate ? arrivalScale(scarHours[k]) : "";
     }
-    scarG.style("display", S.view === "duration" ? "none" : null);
-    durG.style("display", S.view === "duration" ? null : "none");
-    trailG.style("display", S.view === "power" ? null : "none");
-  }
-
-  function ensureDuration() {
-    if (durNodes) return;
-    durationScale = d3.scaleSequentialLog([1, Math.max(10, d3.quantile(pixHours.map(a => a.length).filter(Boolean).sort(d3.ascending), 0.995))], durationRamp).clamp(true);
-    const burned = d3.range(N).filter(i => firstHour[i] >= 0);
-    const sel = durG.selectAll("path").data(burned).join("path").attr("d", i => dstr[i]).style("display", "none");
-    durNodes = new Array(N);
-    sel.each(function (i) { durNodes[i] = this; });
-    durCount = new Int32Array(N);
+    scarG.classed("by-date", byDate);
+    activeG.classed("by-date", byDate);
+    trailG.style("display", byDate ? "none" : null);
   }
 
   function renderHour() {
@@ -413,53 +342,36 @@ function createMap() {
     const active = activeAt[h] || [];
     nowSet = new Map(active.map(r => [r.i, r]));
 
-    if (S.view !== "duration") {
-      for (let k = 0; k < scarNodes.length; k++) {
-        const show = scarHours[k] <= h;
-        if (scarShown[k] !== show) {
-          scarNodes[k].style.display = show ? "" : "none";
-          scarShown[k] = show;
-        }
-      }
-    } else {
-      ensureDuration();
-      for (let i = 0; i < N; i++) {
-        const node = durNodes[i];
-        if (!node) continue;
-        const count = firstHour[i] <= h ? hoursBurned(i, h) : 0;
-        if (count !== durCount[i]) {
-          durCount[i] = count;
-          node.style.display = count ? "" : "none";
-          if (count) node.style.color = durationScale(count);
-        }
+    for (let k = 0; k < scarNodes.length; k++) {
+      const show = scarHours[k] <= h;
+      if (scarShown[k] !== show) {
+        scarNodes[k].style.display = show ? "" : "none";
+        scarShown[k] = show;
       }
     }
 
     activeG.selectAll("path").data(active, d => d.i).join("path")
       .attr("d", d => dstr[d.i])
-      .style("color", d => (S.view === "power" ? (d.mw > 0 ? powerScale(d.mw) : UNMEASURED) : NOW_WHITE));
+      .style("color", d => (S.view === "power" ? (d.mw > 0 ? powerScale(d.mw) : UNMEASURED) : "#fff"));
     if (S.view === "power") activeG.selectAll("path").sort((p, q) => (p.mw > 0 ? p.mw : 0) - (q.mw > 0 ? q.mw : 0));
 
     let trail = [];
-    if (S.view === "power" && S.trail > 0) {
+    if (S.view === "power") {
       const last = new Map();
-      for (let g = Math.max(0, h - S.trail); g < h; g++) {
+      for (let g = Math.max(0, h - TRAIL_HOURS); g < h; g++) {
         for (const r of activeAt[g]) if (!nowSet.has(r.i)) last.set(r.i, g);
       }
       trail = [...last];
     }
     trailG.selectAll("path").data(trail, d => d[0]).join("path")
       .attr("d", d => dstr[d[0]])
-      .style("opacity", d => 0.12 + 0.5 * (1 - (h - d[1]) / S.trail));
+      .style("opacity", d => 0.1 + 0.6 * (1 - (h - d[1]) / TRAIL_HOURS));
 
     drawReach();
-    document.getElementById("clock-date").textContent = `${fmtDay(hourDate(h))} · ${fmtHour(hourDate(h))}`;
-    document.getElementById("clock-sub").textContent = `local solar time · ${isNight(h % 24) ? "night" : "day"}`;
   }
 
-  let reachXY = null;
   function drawReach() {
-    const run = S.scope.type === "fire" ? runById(S.scope.id) : null;
+    const run = selectedRun();
     const p = run ? reachAt(run, S.hour) : null;
     reachRing.style("display", p ? null : "none");
     reachLine.style("display", p ? null : "none");
@@ -470,7 +382,7 @@ function createMap() {
       reachRing.attr("d", path(d3.geoCircle().center(run.origin).radius(p[1] / 111.195).precision(3)()));
       reachLine.attr("x1", o[0]).attr("y1", o[1]).attr("x2", far[0]).attr("y2", far[1]);
       reachXY = far;
-      reachLabel.text(`${fmtInt(p[1])} km ${compass(p[2])}`);
+      reachLabel.text(`${fmtInt(p[1])} km`);
     }
     placeReachLabel();
   }
@@ -484,71 +396,15 @@ function createMap() {
   }
 
   function selectionChanged() {
-    perimG.selectAll("path").classed("selected", d => S.scope.type === "fire" && d.runId === S.scope.id);
-    drawRegion();
+    perimG.selectAll("path").classed("selected", r => r.id === S.fire);
+    fireLabels.selectAll("g").classed("dim", r => S.fire && r.id !== S.fire);
     drawReach();
+    onTransform();
   }
 
   function highlight(id) {
-    perimG.selectAll("path").classed("hover", d => id != null && d.runId === id);
+    perimG.selectAll("path").classed("hover", r => r.id === id && r.id !== S.fire);
   }
-
-  /* Region box. Stored as two lon/lat corners; a rectangle in projected space. */
-  function regionRect() {
-    const [p0, p1] = S.scope.geo.map(g => projection(g));
-    return [Math.min(p0[0], p1[0]), Math.min(p0[1], p1[1]), Math.max(p0[0], p1[0]), Math.max(p0[1], p1[1])];
-  }
-
-  function drawRegion() {
-    if (S.scope.type !== "region") {
-      boxRect.style("display", "none");
-      return;
-    }
-    const [x0, y0, x1, y1] = regionRect();
-    boxRect.style("display", null).attr("x", x0).attr("y", y0).attr("width", x1 - x0).attr("height", y1 - y0);
-  }
-
-  function regionMask() {
-    const key = scopeKey();
-    if (mask && maskKey === key) return mask;
-    const [x0, y0, x1, y1] = regionRect();
-    mask = new Uint8Array(N);
-    for (let i = 0; i < N; i++) mask[i] = cx[i] >= x0 && cx[i] <= x1 && cy[i] >= y0 && cy[i] <= y1 ? 1 : 0;
-    maskKey = key;
-    return mask;
-  }
-
-  /* Drag a box: Shift-drag, or any drag while Select area is on. */
-  let drag = null;
-  svg.on("pointerdown.select", event => {
-    if (!(event.shiftKey || S.selecting) || event.button) return;
-    event.preventDefault();
-    const start = t.invert(d3.pointer(event, svg.node()));
-    drag = { start, end: start };
-    svg.node().setPointerCapture(event.pointerId);
-    tooltip.hide();
-  });
-  svg.on("pointermove.select", event => {
-    if (!drag) return;
-    drag.end = t.invert(d3.pointer(event, svg.node()));
-    const [x0, y0] = drag.start, [x1, y1] = drag.end;
-    boxRect.style("display", null).attr("x", Math.min(x0, x1)).attr("y", Math.min(y0, y1))
-      .attr("width", Math.abs(x1 - x0)).attr("height", Math.abs(y1 - y0));
-  });
-  svg.on("pointerup.select pointercancel.select", event => {
-    if (!drag) return;
-    const { start, end } = drag;
-    drag = null;
-    svg.node().releasePointerCapture(event.pointerId);
-    const bigEnough = Math.abs(end[0] - start[0]) * t.k > 8 && Math.abs(end[1] - start[1]) * t.k > 8;
-    setSelecting(false);
-    if (bigEnough) {
-      const round = g => g.map(v => +v.toFixed(3));
-      setScope({ type: "region", geo: [round(projection.invert(start)), round(projection.invert(end))] });
-    } else {
-      drawRegion();
-    }
-  });
 
   /* Nearest pixel that has burned by the current hour. */
   function nearestBurned(bx, by, r) {
@@ -571,27 +427,24 @@ function createMap() {
 
   function pixelTip(event, i) {
     const p = pixelData.pos[i];
-    const h = S.hour;
     const rec = nowSet.get(i);
     const run = runs.find(r => pixelData.fireIndex.get(r.id) === p.fire);
     const rows = [];
     if (rec) {
-      rows.push(rec.mw > 0 ? [`${fmtInt(rec.mw)} MW`, "measured power", powerScale(rec.mw)]
-        : rec.mw < 0 ? [`about ${fmtInt(-rec.mw)} MW`, "estimated, cloud-flagged", UNMEASURED]
-        : ["No power value", "faint detection", UNMEASURED]);
-      rows.push([`${rec.scans} of 12`, "scans saw it this hour"]);
+      rows.push(rec.mw > 0 ? [`${fmtInt(rec.mw)} MW`, "of heat, measured", powerScale(rec.mw)]
+        : rec.mw < 0 ? [`about ${fmtInt(-rec.mw)} MW`, "estimated, cloud in the way", UNMEASURED]
+        : ["Burning", "too faint to measure", UNMEASURED]);
     } else {
-      rows.push(["Not burning", "this hour", cssVar("--context")]);
+      rows.push(["Not burning", "this hour"]);
     }
-    rows.push([hourStamp(firstHour[i]), "first burned"]);
-    const hrs = hoursBurned(i, h);
-    rows.push([`${hrs} h`, "burning so far"]);
+    rows.push([hourStamp(firstHour[i]), "fire first seen here"]);
+    rows.push([`${d3.bisectRight(pixHours[i], S.hour)} h`, "seen burning so far"]);
     tooltip.show(event.clientX, event.clientY,
       `${run ? `${run.name} fire` : "Fire pixel"} · ${p.lat.toFixed(2)}°N ${Math.abs(p.lon).toFixed(2)}°W`, rows);
   }
 
   svg.on("pointermove.hover", event => {
-    if (drag || event.buttons) return;
+    if (event.buttons) return;
     const [bx, by] = t.invert(d3.pointer(event, svg.node()));
     const i = nearestBurned(bx, by, Math.max(pxBase * 1.1, 7 / t.k));
     if (i >= 0) {
@@ -602,147 +455,117 @@ function createMap() {
     }
     hoverId = null;
     hoverPath.style("display", "none");
-    const d = d3.select(event.target).datum();
-    if (d && d.acres && d.geo) {
-      tooltip.show(event.clientX, event.clientY, `${d.name} fire${d.state ? `, ${d.state}` : ""}`, [
-        [fmtInt(d.acres), "acres, final perimeter"],
-        [fmtDay(new Date(d.discovered)), "discovered"],
-        ...(d.cause ? [[d.cause, "cause"]] : []),
-        [d.runId ? "Click" : "Click", d.runId ? "to chart this fire" : "to zoom here"],
+    const r = d3.select(event.target).datum();
+    if (r && r.perimeterGeo) {
+      highlight(r.id);
+      tooltip.show(event.clientX, event.clientY, `${r.name} fire, ${r.place}`, [
+        [fmtInt(r.acres), "acres by the end"],
+        [fmtDay(new Date(r.discovered)), "first reported"],
+        ...(r.id === S.fire ? [] : [["Click", "to follow this fire"]]),
       ]);
     } else {
+      highlight(null);
       tooltip.hide();
     }
   });
   svg.on("pointerleave.hover", () => {
     hoverId = null;
     hoverPath.style("display", "none");
+    highlight(null);
     tooltip.hide();
   });
 
-  function dismissHint() {
-    document.getElementById("map-hint").classList.add("gone");
-  }
-
-  d3.select("#zoom-in").on("click", () => svg.transition().duration(REDUCED_MOTION ? 0 : 250).call(zoom.scaleBy, 1.8));
-  d3.select("#zoom-out").on("click", () => svg.transition().duration(REDUCED_MOTION ? 0 : 250).call(zoom.scaleBy, 1 / 1.8));
+  const zoomBy = k => svg.transition().duration(REDUCED_MOTION ? 0 : 250).call(zoom.scaleBy, k);
+  d3.select("#zoom-in").on("click", () => zoomBy(1.8));
+  d3.select("#zoom-out").on("click", () => zoomBy(1 / 1.8));
   d3.select("#zoom-home").on("click", () => svg.transition().duration(REDUCED_MOTION ? 0 : 600).call(zoom.transform, d3.zoomIdentity));
 
-  return {
-    layout, renderHour, paintScar, selectionChanged, highlight, regionMask, flyTo, updateNote, dismissHint,
-    zoomBy: k => svg.transition().duration(REDUCED_MOTION ? 0 : 250).call(zoom.scaleBy, k),
-  };
+  return { layout, renderHour, paint, selectionChanged, fly, zoomBy };
 }
 
 /* ---------- timeline ---------- */
 
 function createTimeline() {
   const svg = d3.select("#timeline").append("svg").attr("role", "img")
-    .attr("aria-label", "Timeline of the selected measure by hour, with a strip below for choosing a span of days");
-  const margin = { top: 18, right: 14, bottom: 20, left: 46 };
-  const focusH = 150, gap = 24, stripH = 34;
+    .attr("aria-label", "Fire power by hour. Drag to move through time.");
+  const margin = { top: 16, right: 10, bottom: 18, left: 10 };
+  const focusH = 64;
   const clipRect = svg.append("defs").append("clipPath").attr("id", "tl-clip").append("rect");
   const plot = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
-  const gridG = plot.append("g").attr("class", "grid");
   const nightG = plot.append("g").attr("clip-path", "url(#tl-clip)");
-  const dataG = plot.append("g").attr("clip-path", "url(#tl-clip)");
-  const area = dataG.append("path").attr("class", "value-area");
-  const line = dataG.append("path").attr("class", "value-line");
+  const area = plot.append("path").attr("class", "tl-area").attr("clip-path", "url(#tl-clip)");
+  const line = plot.append("path").attr("class", "tl-line").attr("clip-path", "url(#tl-clip)");
+  const future = plot.append("rect").attr("class", "tl-future");
   const xAxisG = plot.append("g").attr("class", "axis");
-  const yAxisG = plot.append("g").attr("class", "axis");
-  const unitLabel = plot.append("text").attr("y", -7).attr("x", -margin.left + 2);
+  const unitLabel = plot.append("text").attr("y", -5).attr("text-anchor", "end");
   const peakLabel = plot.append("text").attr("class", "peak-label");
-  const emptyMsg = plot.append("text").attr("class", "empty-msg").attr("text-anchor", "middle");
   const crosshair = plot.append("line").attr("class", "crosshair").style("display", "none");
   const playhead = plot.append("g").attr("class", "playhead").style("pointer-events", "none");
   playhead.append("line");
-  playhead.append("path").attr("d", "M-5,-7h10v4l-5,5l-5,-5z");
-  const playDot = plot.append("circle").attr("class", "playhead-dot").attr("r", 4).style("pointer-events", "none");
+  playhead.append("path").attr("d", "M-5,-8h10v4l-5,5l-5,-5z");
   const overlay = plot.append("rect").attr("fill", "transparent").style("cursor", "ew-resize").style("touch-action", "none");
-
-  const strip = svg.append("g");
-  const stripArea = strip.append("path").attr("class", "context-area");
-  const stripAxisG = strip.append("g").attr("class", "axis");
-  const brushG = strip.append("g");
-  const stripNow = strip.append("line").attr("class", "context-now");
-  const brush = d3.brushX().on("brush end", onBrush);
-
-  let x, y, rows = [], innerW = 0, stripX = d3.scaleUtc(), syncing = false, dragging = false;
-
-  function onBrush(event) {
-    if (syncing) return;
-    const sel = event.selection;
-    if (!sel) {
-      if (event.type === "end") setWindow(null);
-      return;
-    }
-    const hourAt = px => (stripX.invert(px) - hourDate(0)) / HOUR_MS;
-    const a = Math.max(0, Math.min(totalHours - MIN_WINDOW_HOURS, Math.floor(hourAt(sel[0]))));
-    const b = Math.min(totalHours, Math.max(a + MIN_WINDOW_HOURS, Math.ceil(hourAt(sel[1]))));
-    setWindow([a, b], { animate: false });
-  }
-
-  function moveBrush() {
-    syncing = true;
-    brushG.call(brush.move, S.window ? S.window.map(i => stripX(hourDate(i))) : null);
-    syncing = false;
-  }
+  const startsG = plot.append("g");
+  let x, rows = [], innerW = 0, dragging = false;
 
   function draw({ animate = false } = {}) {
-    const width = Math.max(300, document.getElementById("timeline").clientWidth);
-    const totalH = margin.top + focusH + margin.bottom + gap + stripH + 18;
+    const width = Math.max(260, document.getElementById("timeline").clientWidth);
+    const totalH = margin.top + focusH + margin.bottom;
     svg.attr("viewBox", `0 0 ${width} ${totalH}`).attr("height", totalH);
     innerW = width - margin.left - margin.right;
     clipRect.attr("width", innerW).attr("height", focusH + 1);
 
-    const m = MEASURES[S.measure];
-    const all = scopeSeries();
-    rows = rowsInWindow();
     const [a, b] = win();
+    rows = scopeSeries().slice(a, b);
     const days = (b - a) / 24;
     x = d3.scaleUtc().domain([hourDate(a), hourDate(b - 1)]).range([0, innerW]);
-    const yMax = d3.max(rows, m.scaleValue) || 0;
-    y = d3.scaleLinear().domain([0, (yMax || 1) * 1.08]).nice(4).range([focusH, 0]);
+    const peak = d3.greatest(rows, d => d.filled);
+    const y = d3.scaleLinear().domain([0, (peak ? peak.filled : 0) || 1]).range([focusH, 4]);
 
-    gridG.call(d3.axisLeft(y).ticks(4).tickSize(-innerW).tickFormat(""));
-    yAxisG.call(d3.axisLeft(y).ticks(4).tickSize(0).tickPadding(8).tickFormat(d3.format(",")));
-    yAxisG.select(".domain").remove();
     xAxisG.attr("transform", `translate(0,${focusH})`)
-      .call(d3.axisBottom(x).ticks(Math.max(3, innerW / 100)).tickSizeOuter(0)
+      .call(d3.axisBottom(x).ticks(Math.max(3, innerW / 110)).tickSize(3).tickSizeOuter(0)
         .tickFormat(d => (d.getUTCHours() !== 0 ? fmtHour(d) : fmtDay(d))));
-    unitLabel.text(m.unit);
+    const run = selectedRun();
+    unitLabel.attr("x", innerW).text(`Heat given off by ${run ? `the ${run.name} fire` : "every fire in the West"}, hour by hour`);
 
     nightG.selectAll("rect").data(days <= NIGHT_BAND_MAX_DAYS ? nightSpans(a, b) : []).join("rect")
-      .attr("class", "night-band")
+      .attr("class", "tl-night")
       .attr("x", d => x(hourDate(d[0]))).attr("width", d => x(hourDate(d[1])) - x(hourDate(d[0])))
       .attr("height", focusH);
 
-    const areaGen = d3.area().x(d => x(d.date)).y0(focusH).y1(d => y(m.value(d))).curve(m.curve);
-    const apply = sel => (animate && !REDUCED_MOTION ? sel.transition().duration(400) : sel);
+    const areaGen = d3.area().x(d => x(d.date)).y0(focusH).y1(d => y(d.filled)).curve(d3.curveMonotoneX);
+    const apply = sel => (animate && !REDUCED_MOTION ? sel.transition().duration(500) : sel);
     area.datum(rows);
     line.datum(rows);
     apply(area).attr("d", areaGen);
     apply(line).attr("d", areaGen.lineY1());
 
-    const peak = d3.greatest(rows, m.value);
-    const hasData = peak && m.value(peak) > 0;
-    peakLabel.style("display", hasData ? null : "none");
-    emptyMsg.style("display", hasData ? "none" : null).attr("x", innerW / 2).attr("y", focusH / 2)
-      .text(`No fire detected for ${scopeName()} in ${windowLabel()}.`);
-    if (hasData) {
+    const hasPeak = peak && peak.filled > 0;
+    peakLabel.style("display", hasPeak ? null : "none");
+    if (hasPeak) {
       const px = x(peak.date);
-      const right = px > innerW * 0.7;
-      peakLabel.attr("x", px + (right ? -8 : 8)).attr("y", Math.max(10, y(m.value(peak)) - 6))
-        .attr("text-anchor", right ? "end" : "start")
-        .text(`Peak ${m.fmt(m.value(peak))}, ${hourStamp(peak.i)}`);
+      const right = px > innerW * 0.75;
+      peakLabel.attr("x", px + (right ? -8 : 8)).attr("y", 12).attr("text-anchor", right ? "end" : "start")
+        .text(`Peak: ${fmtPower(peak.filled)}, ${hourStamp(peak.i)}`);
     }
+
+    // One marker per named fire at the hour it was first reported.
+    const starts = (run ? [run] : runs).filter(r => discoveryHour(r) >= a && discoveryHour(r) < b);
+    startsG.selectAll("circle").data(starts, r => r.id).join("circle").attr("class", "tl-start").attr("r", 4)
+      .classed("on", r => r.id === S.fire)
+      .attr("cx", r => x(hourDate(discoveryHour(r)))).attr("cy", focusH)
+      .on("pointermove", (event, r) => tooltip.show(event.clientX, event.clientY, `${r.name} fire, ${r.place}`, [
+        [fmtDay(new Date(r.discovered)), "first reported"],
+        [fmtInt(r.acres), "acres by the end"],
+        ...(r.id === S.fire ? [] : [["Click", "to follow this fire"]]),
+      ]))
+      .on("pointerleave", () => tooltip.hide())
+      .on("click", (event, r) => { if (S.fire !== r.id) setFire(r.id, { fromStart: true }); });
 
     const hourAtPointer = event => {
       const [mx] = d3.pointer(event, overlay.node());
-      const i = d3.bisector(d => d.date).center(rows, x.invert(Math.max(0, Math.min(innerW, mx))));
-      return rows[i];
+      return rows[d3.bisector(d => d.date).center(rows, x.invert(Math.max(0, Math.min(innerW, mx))))];
     };
-    overlay.attr("width", innerW).attr("height", focusH)
+    overlay.attr("y", -margin.top).attr("width", innerW).attr("height", focusH + margin.top)
       .on("pointerdown", event => {
         dragging = true;
         overlay.node().setPointerCapture(event.pointerId);
@@ -752,14 +575,12 @@ function createTimeline() {
       .on("pointermove", event => {
         const d = hourAtPointer(event);
         if (!d) return;
-        if (dragging) { setHour(d.i); }
+        if (dragging) setHour(d.i);
         const px = x(d.date);
         crosshair.style("display", dragging ? "none" : null).attr("x1", px).attr("x2", px).attr("y1", 0).attr("y2", focusH);
-        tooltip.show(event.clientX, event.clientY, `${hourStamp(d.i)} solar${isNight(d.hod) ? " (night)" : ""}`, [
-          [fmtPower(d.filled), "power, gap-filled", cssVar("--ember")],
-          [fmtPower(d.reported), "power, reported only"],
+        tooltip.show(event.clientX, event.clientY, `${hourStamp(d.i)}${isNight(d.hod) ? ", night" : ""}`, [
+          [fmtPower(d.filled), "of heat", "#f0701c"],
           [fmtInt(d.n), "pixels burning"],
-          [fmtInt(d.fresh), "of them new ground"],
         ]);
       })
       .on("pointerup pointercancel", event => {
@@ -771,29 +592,14 @@ function createTimeline() {
         tooltip.hide();
       });
 
-    const stripTop = margin.top + focusH + margin.bottom + gap;
-    strip.attr("transform", `translate(${margin.left},${stripTop})`);
-    stripX = d3.scaleUtc().domain([hourDate(0), hourDate(totalHours - 1)]).range([0, innerW]);
-    const stripY = d3.scaleLinear().domain([0, d3.max(all, m.scaleValue) || 1]).range([stripH, 0]);
-    stripArea.datum(all).attr("d", d3.area().x(d => stripX(d.date)).y0(stripH).y1(d => stripY(m.scaleValue(d))));
-    stripAxisG.attr("transform", `translate(0,${stripH})`)
-      .call(d3.axisBottom(stripX).ticks(d3.utcWeek.every(innerW < 480 ? 2 : 1)).tickSize(0).tickPadding(6).tickFormat(fmtDay));
-    brush.extent([[0, 0], [innerW, stripH]]);
-    brushG.call(brush);
-    moveBrush();
-
-    document.getElementById("timeline-title").textContent = `${m.label()}. ${scopeName()}, ${windowLabel()}.`;
     movePlayhead();
   }
 
   function movePlayhead() {
     if (!x) return;
-    const d = scopeSeries()[S.hour];
-    const px = x(d.date);
+    const px = x(hourDate(S.hour));
     playhead.attr("transform", `translate(${px},0)`).select("line").attr("y1", 0).attr("y2", focusH);
-    playDot.attr("cx", px).attr("cy", y(MEASURES[S.measure].value(d)));
-    const sx = stripX(d.date);
-    stripNow.attr("x1", sx).attr("x2", sx).attr("y1", -3).attr("y2", stripH + 3);
+    future.attr("x", px).attr("y", 0).attr("width", Math.max(0, innerW - px)).attr("height", focusH);
   }
 
   return { draw, movePlayhead };
@@ -818,268 +624,61 @@ function createPlayer() {
     if (S.hour >= b - 1) setHour(a);
     button.setAttribute("aria-pressed", "true");
     button.setAttribute("aria-label", "Pause");
-    map.dismissHint();
+    const speed = Math.max(3, (b - a) / PLAY_SECONDS); // hours per second
     let last = 0, acc = 0;
     timer = d3.timer(elapsed => {
-      acc += Math.min(120, elapsed - last) / 1000 * S.speed;
+      acc += Math.min(120, elapsed - last) / 1000 * speed;
       last = elapsed;
       if (acc < 1) return;
       const step = Math.floor(acc);
       acc -= step;
       const end = win()[1] - 1;
-      const next = S.hour + step;
-      if (next >= end) {
+      if (S.hour + step >= end) {
         setHour(end);
         stop();
       } else {
-        setHour(next);
+        setHour(S.hour + step);
       }
     });
   }
 
   button.addEventListener("click", () => (timer ? stop() : play()));
-  return { play, stop, toggle: () => (timer ? stop() : play()), get playing() { return !!timer; } };
+  return { play, stop, toggle: () => (timer ? stop() : play()) };
 }
 
-/* ---------- side panel ---------- */
+/* ---------- text ---------- */
 
-function updateReadout() {
-  const d = scopeSeries()[S.hour];
-  document.getElementById("stat-n").textContent = fmtInt(d.n);
-  document.getElementById("stat-fresh").textContent = fmtInt(d.fresh);
-  const [value, unit] = fmtPower(d.filled).split(" ");
-  document.getElementById("stat-power").innerHTML = `${value}<small>${unit}</small>`;
+function updateClock() {
+  const h = S.hour;
+  const d = scopeSeries()[h];
+  document.getElementById("clock-date").textContent = `${fmtDay(hourDate(h))} · ${fmtHour(hourDate(h))}`;
+  document.getElementById("clock-sub").innerHTML = d.n
+    ? `<b>${fmtInt(d.n)}</b> pixel${d.n === 1 ? "" : "s"} burning · ${d.filled >= 0.0005 ? `<b>${fmtPower(d.filled)}</b> of heat` : "too faint to measure"}`
+    : `No fire seen this hour${isNight(h % 24) ? ", night" : ""}`;
 }
 
-function updateScopeText() {
-  const s = S.scope;
-  document.getElementById("scope-name").textContent = s.type === "fire" ? `${scopeName()} fire` : scopeName();
-  document.getElementById("scope-clear").hidden = s.type === "all";
-  let sub;
-  if (s.type === "fire") {
-    const r = runById(s.id);
-    sub = `${r.place} · ${fmtInt(r.acres)} acres · discovered ${fmtDay(new Date(r.discovered))}${r.cause ? ` · ${r.cause.toLowerCase()} cause` : ""}`;
-  } else if (s.type === "region") {
-    sub = `${fmtInt(d3.sum(map.regionMask()))} pixel positions inside the box you drew. Power here is rebuilt from hourly pixel means.`;
-  } else {
-    sub = `Every fire pixel in the study area, ${fmtInt(N)} pixel positions.`;
-  }
-  document.getElementById("scope-sub").textContent = sub;
-}
-
-const SORTS = {
-  acres: { key: r => -r.acres, text: r => `${fmtAcres(r.acres).replace("k", "k ac")}` },
-  peak: { key: r => -r.peakGW, text: r => fmtPower(r.peakGW) },
-  fastest: { key: r => -r.fastest.km, text: r => `${fmtInt(r.fastest.km)} km` },
-  start: { key: r => +new Date(r.discovered), text: r => fmtDay(new Date(r.discovered)) },
-};
-const SPARK_W = 96, SPARK_H = 22;
-
-function buildFireList() {
-  const sx = d3.scaleLinear([0, totalHours - 1], [0, SPARK_W]);
-  for (const r of runs) {
-    const hours = seriesById.get(r.id).hours;
-    r.peakGW = d3.max(hours, d => d.filled);
-    // Daily peaks on a square-root scale: hourly power is too spiky to read at 96 px.
-    const sy = d3.scaleSqrt([0, r.peakGW || 1], [SPARK_H, 1]);
-    const bins = d3.range(0, totalHours, 24).map(i => ({ i, v: d3.max(hours.slice(i, i + 24), d => d.filled) }));
-    r.spark = d3.area().x(d => sx(d.i)).y0(SPARK_H).y1(d => sy(d.v)).curve(d3.curveStepAfter)([...bins, { i: totalHours - 1, v: bins[bins.length - 1].v }]);
-  }
-  const rows = d3.select("#fire-list").selectAll("button").data(runs, r => r.id).join("button")
-    .attr("type", "button").attr("class", "fire-row").attr("role", "listitem")
-    .on("click", (_, r) => setScope(S.scope.type === "fire" && S.scope.id === r.id ? { type: "all" } : { type: "fire", id: r.id }))
-    .on("pointerenter focus", (_, r) => map.highlight(r.id))
-    .on("pointerleave blur", () => map.highlight(null));
-  const name = rows.append("span").attr("class", "fr-name");
-  name.append("i").attr("class", "fr-dot");
-  name.append("span").text(r => r.name);
-  name.append("small").text(r => r.place);
-  const spark = rows.append("svg").attr("width", SPARK_W).attr("height", SPARK_H).attr("aria-hidden", "true");
-  spark.append("path").attr("class", "spark-area").attr("d", r => r.spark);
-  spark.append("line").attr("class", "spark-now").attr("y1", 0).attr("y2", SPARK_H);
-  rows.append("span").attr("class", "fr-value");
-  sortFireList();
-}
-
-function sortFireList() {
-  const sort = SORTS[S.sort];
-  d3.select("#fire-list").selectAll("button").sort((a, b) => d3.ascending(sort.key(a), sort.key(b)))
-    .select(".fr-value").text(sort.text);
-}
-
-function updateFireList() {
-  const px = S.hour / (totalHours - 1) * SPARK_W;
-  const rows = d3.select("#fire-list").selectAll("button");
-  rows.attr("aria-pressed", r => S.scope.type === "fire" && S.scope.id === r.id)
-    .attr("title", r => `${r.name}: ${fmtPower(seriesById.get(r.id).hours[S.hour].filled)} at ${hourStamp(S.hour)}`);
-  rows.select(".spark-now").attr("x1", px).attr("x2", px);
-  rows.select(".fr-dot").classed("on", r => {
-    const d = seriesById.get(r.id).hours[S.hour];
-    return d.withFrp + d.noFrp > 0;
-  });
-}
-
-function createTod() {
-  const svg = d3.select("#tod").append("svg").attr("role", "img")
-    .attr("aria-label", "Average pixels burning at each solar hour of the day, for the selection and span of days");
-  const margin = { top: 8, right: 4, bottom: 18, left: 30 };
-  const height = 128;
-  const nightG = svg.append("g");
-  const gridG = svg.append("g").attr("class", "grid");
-  const barsG = svg.append("g").style("pointer-events", "none");
-  const nowRect = svg.append("rect").attr("class", "tod-bar-now").attr("rx", 3);
-  const xAxisG = svg.append("g").attr("class", "axis");
-  const yAxisG = svg.append("g").attr("class", "axis");
-  const hitG = svg.append("g");
-  let x, y, bins, barW;
-
-  function draw() {
-    const width = Math.max(240, document.getElementById("tod").clientWidth);
-    svg.attr("viewBox", `0 0 ${width} ${height}`).attr("height", height);
-    const innerW = width - margin.left - margin.right;
-    const bottom = height - margin.bottom;
-    bins = hourProfile(rowsInWindow());
-    x = d3.scaleBand().domain(d3.range(24)).range([margin.left, margin.left + innerW]);
-    y = d3.scaleLinear().domain([0, d3.max(bins, d => d.total) || 1]).nice(3).range([bottom, margin.top]);
-    barW = Math.max(2, x.bandwidth() - 2);
-    const barX = h => x(h) + (x.bandwidth() - barW) / 2;
-
-    nightG.selectAll("rect").data([[0, NIGHT_END], [NIGHT_START, 24]]).join("rect").attr("class", "night-band")
-      .attr("x", d => x(d[0])).attr("width", d => (d[1] - d[0]) * x.step()).attr("y", margin.top).attr("height", bottom - margin.top);
-    gridG.attr("transform", `translate(${margin.left},0)`).call(d3.axisLeft(y).ticks(3).tickSize(-innerW).tickFormat(""));
-    yAxisG.attr("transform", `translate(${margin.left},0)`).call(d3.axisLeft(y).ticks(3).tickSize(0).tickPadding(6));
-    yAxisG.select(".domain").remove();
-    xAxisG.attr("transform", `translate(0,${bottom})`)
-      .call(d3.axisBottom(x).tickValues([0, 6, 12, 18]).tickSizeOuter(0).tickFormat(hourLabel));
-
-    barsG.selectAll("path.bar-power").data(bins, d => d.h).join("path").attr("class", "bar-power")
-      .attr("d", d => {
-        const top = y(d.withFrp);
-        return d.noFrp > 0 ? `M${barX(d.h)},${top}h${barW}v${bottom - top}h${-barW}Z` : roundedTopBar(barX(d.h), top, barW, bottom - top, 3);
-      });
-    barsG.selectAll("path.bar-nopower").data(bins, d => d.h).join("path").attr("class", "bar-nopower")
-      .attr("d", d => roundedTopBar(barX(d.h), y(d.total), barW, Math.max(0, y(d.withFrp) - y(d.total) - 1), 3));
-
-    hitG.selectAll("rect").data(bins, d => d.h).join("rect").attr("class", "hit")
-      .attr("x", d => x(d.h)).attr("width", x.step()).attr("y", margin.top).attr("height", bottom - margin.top)
-      .on("pointermove", (event, d) => tooltip.show(event.clientX, event.clientY, `${hourLabel(d.h)} solar${isNight(d.h) ? " (night)" : ""}`, [
-        [fmt1(d.withFrp), "pixels with measured power", cssVar("--ember")],
-        [fmt1(d.noFrp), "pixels without", cssVar("--nopower")],
-        [fmtPct(d.share), "have no measured power"],
-        ["Click", "to move the map to this hour"],
-      ]))
-      .on("pointerleave", () => tooltip.hide())
-      .on("click", (_, d) => {
-        player.stop();
-        setHour(clampHour(Math.floor(S.hour / 24) * 24 + d.h));
-      });
-
-    const peak = d3.greatest(bins, d => d.total);
-    document.getElementById("tod-note").textContent = peak && peak.total
-      ? `mean pixels per hour · peak ${hourLabel(peak.h)}` : "no detections";
-    mark();
-  }
-
-  function mark() {
-    if (!x) return;
-    const h = S.hour % 24;
-    const d = bins[h];
-    const top = Math.min(y(d.total), y.range()[0] - 3);
-    nowRect.attr("x", x(h) + (x.bandwidth() - barW) / 2 - 1.5).attr("width", barW + 3)
-      .attr("y", top - 1.5).attr("height", y.range()[0] - top + 1.5);
-  }
-
-  return { draw, mark };
-}
-
-function createReach() {
-  const svg = d3.select("#reach").append("svg").attr("role", "img")
-    .attr("aria-label", "Farthest fire pixel connected to the fire's origin, by days since discovery");
-  const margin = { top: 8, right: 8, bottom: 30, left: 30 };
-  const height = 138;
-  const gridG = svg.append("g").attr("class", "grid");
-  const line = svg.append("path").attr("class", "reach-line");
-  const mergeG = svg.append("g");
-  const future = svg.append("rect").attr("class", "reach-future");
-  const dot = svg.append("circle").attr("class", "playhead-dot").attr("r", 4);
-  const xAxisG = svg.append("g").attr("class", "axis");
-  const yAxisG = svg.append("g").attr("class", "axis");
-  const xLabel = svg.append("text").attr("text-anchor", "end").text("Days since discovery");
-  const overlay = svg.append("rect").attr("fill", "transparent").style("cursor", "ew-resize").style("touch-action", "none");
-  let x, y, run = null;
-
-  function draw() {
-    run = S.scope.type === "fire" ? runById(S.scope.id) : null;
-    document.getElementById("reach").style.display = run ? "" : "none";
-    document.getElementById("reach-empty").style.display = run ? "none" : "";
-    document.getElementById("reach-note").textContent = "";
-    if (!run) return;
-    const width = Math.max(240, document.getElementById("reach").clientWidth);
-    svg.attr("viewBox", `0 0 ${width} ${height}`).attr("height", height);
-    const innerW = width - margin.left - margin.right;
-    const bottom = height - margin.bottom;
-    const lastDay = Math.min(Math.max(run.lastHour / 24 + 1, 3), (totalHours - discoveryHour(run)) / 24);
-    x = d3.scaleLinear().domain([0, lastDay]).range([margin.left, margin.left + innerW]);
-    y = d3.scaleLinear().domain([0, run.farthest]).nice(3).range([bottom, margin.top]);
-    gridG.attr("transform", `translate(${margin.left},0)`).call(d3.axisLeft(y).ticks(3).tickSize(-innerW).tickFormat(""));
-    yAxisG.attr("transform", `translate(${margin.left},0)`).call(d3.axisLeft(y).ticks(3).tickSize(0).tickPadding(6).tickFormat(d => `${d}`));
-    yAxisG.select(".domain").remove();
-    xAxisG.attr("transform", `translate(0,${bottom})`).call(d3.axisBottom(x).ticks(5).tickSizeOuter(0));
-    xLabel.attr("x", margin.left + innerW).attr("y", height - 2);
-    const pts = [[0, 0], ...run.pts.map(p => [p[0] / 24, p[1]]), [lastDay, run.farthest]];
-    line.attr("d", d3.line().x(p => x(p[0])).y(p => y(p[1])).curve(d3.curveStepAfter)(pts));
-    mergeG.selectAll("circle").data(run.pts.filter(p => p[3] === 1)).join("circle").attr("class", "merge-ring").attr("r", 3.5)
-      .attr("cx", p => x(p[0] / 24)).attr("cy", p => y(p[1]));
-    const seek = event => {
-      const [mx] = d3.pointer(event, svg.node());
-      const day = x.invert(Math.max(margin.left, Math.min(margin.left + innerW, mx)));
-      player.stop();
-      const h = Math.round(discoveryHour(run) + day * 24);
-      if (S.window && (h < S.window[0] || h >= S.window[1])) setWindow(null);
-      setHour(clampHour(h));
-    };
-    overlay.attr("x", margin.left).attr("y", margin.top).attr("width", innerW).attr("height", bottom - margin.top)
-      .on("pointerdown", event => { overlay.node().setPointerCapture(event.pointerId); seek(event); })
-      .on("pointermove", event => { if (event.buttons) seek(event); });
-    mark();
-  }
-
-  function mark() {
-    if (!run || !x) return;
-    const day = Math.max(0, Math.min(x.domain()[1], (S.hour + 1 - discoveryHour(run)) / 24));
-    const p = reachAt(run, S.hour);
-    const km = p ? p[1] : 0;
-    const px = x(day);
-    future.attr("x", px).attr("y", margin.top - 4).attr("width", Math.max(0, x.range()[1] - px + 6)).attr("height", height - margin.bottom - margin.top + 4);
-    dot.attr("cx", px).attr("cy", y(km));
-    document.getElementById("reach-note").textContent = S.hour + 1 < discoveryHour(run) ? "not yet discovered"
-      : p ? `${fmtInt(km)} km ${compass(p[2])} on day ${fmt1(day)}` : "no connected pixel yet";
-  }
-
-  return { draw, mark };
+function updateFireCard() {
+  const run = selectedRun();
+  document.getElementById("fire-card").hidden = !run;
+  if (!run) return;
+  document.getElementById("fire-name").textContent = `${run.name} fire`;
+  document.getElementById("fire-facts").textContent =
+    `${run.place} · ${fmtInt(run.acres)} acres by the end · first reported ${fmtDay(new Date(run.discovered))}`;
+  const days = (S.hour + 1 - discoveryHour(run)) / 24;
+  const p = reachAt(run, S.hour);
+  document.getElementById("fire-reach").textContent = days < 0 ? "Not yet reported."
+    : p ? `Day ${fmt1(days)}: the front is ${fmtInt(p[1])} km ${compass(p[2])} of where it started.`
+    : `Day ${fmt1(days)}: the satellite has not picked it up yet.`;
 }
 
 /* ---------- state changes ---------- */
 
-let tod, reach;
-
 function renderHourAll() {
   map.renderHour();
   timeline.movePlayhead();
-  updateReadout();
-  updateFireList();
-  tod.mark();
-  reach.mark();
+  updateClock();
+  updateFireCard();
   writeHash();
-}
-
-function renderScopeAll({ animate = false } = {}) {
-  updateScopeText();
-  map.selectionChanged();
-  timeline.draw({ animate });
-  tod.draw();
-  reach.draw();
-  renderHourAll();
 }
 
 function setHour(h) {
@@ -1089,122 +688,34 @@ function setHour(h) {
   renderHourAll();
 }
 
-function setWindow(w, { animate = true } = {}) {
-  const same = (!w && !S.window) || (w && S.window && w[0] === S.window[0] && w[1] === S.window[1]);
-  if (same) return;
-  S.window = w;
-  S.hour = clampHour(S.hour);
-  map.paintScar();
+function setFire(id, { fromStart = false } = {}) {
+  player.stop();
+  S.fire = id;
+  const [a, b] = win();
+  const inside = S.hour >= a && S.hour < b;
+  // Follow a fire from its first hour, unless the map is already inside its life.
+  S.hour = id && (fromStart || !inside) ? firstBurnHour() : clampHour(S.hour);
+  map.paint();
+  map.selectionChanged();
+  map.fly();
   drawLegend();
-  timeline.draw({ animate });
-  tod.draw();
+  timeline.draw({ animate: true });
   renderHourAll();
 }
 
-function setScope(scope, { fly = true } = {}) {
-  S.scope = scope;
-  if (scope.type !== "all" && S.window) {
-    // A window with nothing in it for this selection would show an empty chart, so open it up.
-    const any = rowsInWindow().some(d => d.n > 0);
-    if (!any) { S.window = null; map.paintScar(); drawLegend(); }
-  }
-  S.hour = clampHour(S.hour);
-  if (fly && scope.type !== "region") map.flyTo();
-  renderScopeAll({ animate: true });
+function firstBurnHour() {
+  const [a] = win();
+  const d = scopeSeries().slice(a).find(r => r.n > 0);
+  return d ? d.i : a;
 }
 
 function setView(view) {
   S.view = view;
-  setRadio("#view-toggle", "view", view);
-  d3.select("#trail-toggle").style("opacity", view === "power" ? null : 0.45)
-    .attr("title", view === "power" ? null : "Afterglow applies to the Power now view");
-  map.paintScar();
+  d3.selectAll("#view-toggle button").attr("aria-checked", function () { return String(this.dataset.view === view); });
+  map.paint();
   drawLegend();
   map.renderHour();
   writeHash();
-}
-
-function setMeasure(measure) {
-  S.measure = measure;
-  setRadio("#measure-toggle", "measure", measure);
-  document.getElementById("mode-toggle").hidden = measure !== "power";
-  timeline.draw({ animate: true });
-  writeHash();
-}
-
-function setSelecting(on) {
-  S.selecting = on;
-  document.getElementById("select-area").setAttribute("aria-pressed", String(on));
-  document.getElementById("map").classList.toggle("selecting", on);
-}
-
-function setRadio(group, attr, value) {
-  d3.selectAll(`${group} button`).attr("aria-checked", function () { return String(this.dataset[attr]) === String(value); });
-}
-
-function clearMoment() {
-  S.moment = null;
-  d3.selectAll("#moments button").attr("aria-pressed", "false");
-  document.getElementById("moment-caption").textContent = "";
-}
-
-/* ---------- guided moments, computed from the data ---------- */
-
-function buildMoments() {
-  const all = seriesById.get("all").hours;
-  const clampWin = (a, b) => [Math.max(0, Math.round(a)), Math.min(totalHours, Math.round(b))];
-  const peak = d3.greatest(all, d => d.filled);
-  const fast = runs[0];
-  const fastEnd = Math.round(discoveryHour(fast) + fast.fastest.hour);
-  const busy = busiestWindow(all);
-  const big = d3.greatest(runs, r => r.acres);
-  const bigStart = Math.floor(discoveryHour(big));
-  const busyShare = d3.sum(all.slice(...busy), d => d.filled) / d3.sum(all, d => d.filled);
-
-  const moments = [
-    {
-      label: "The peak hour", scope: { type: "all" }, window: clampWin(peak.i - 36, peak.i + 36), hour: peak.i, view: "power", play: false,
-      caption: `The season peaked at ${hourStamp(peak.i)} solar time, when fires across the West put out ${fmtPower(peak.filled)}. Zoom in to see which fronts were hottest.`,
-    },
-    {
-      label: `${fast.name}'s fastest run`, scope: { type: "fire", id: fast.id }, window: clampWin(fastEnd - 30, fastEnd + 18), hour: fastEnd - 8, view: "power", play: true, speed: 6,
-      caption: `${fast.name} pushed its front ${fmtInt(fast.fastest.km)} km in six hours, ${fmtPct(fast.fastest.km / fast.farthest)} of the ${fmtInt(fast.farthest)} km it ever reached from its origin. Watch the dashed ring jump.`,
-    },
-    {
-      label: "The busiest three days", scope: { type: "all" }, window: busy, hour: busy[0], view: "arrival", play: true, speed: 6,
-      caption: `${windowLabelFor(busy)} produced ${fmtPct(busyShare)} of the whole period's fire power. Colour shows when each pixel first burned inside these three days; grey ground was already burnt.`,
-    },
-    {
-      label: `${big.name}: first four days`, scope: { type: "fire", id: big.id }, window: clampWin(bigStart, bigStart + 96), hour: bigStart, view: "arrival", play: true, speed: 6,
-      caption: `${big.name} became the largest fire of the period at ${fmtInt(big.acres)} acres. Its first four days show which way it ran: follow the colour from purple to yellow.`,
-    },
-  ];
-
-  d3.select("#moments").selectAll("button").data(moments).join("button")
-    .attr("type", "button").attr("class", "chip").attr("aria-pressed", "false").text(d => d.label)
-    .on("click", function (_, d) {
-      player.stop();
-      S.window = null;
-      S.scope = d.scope;
-      S.window = d.window;
-      S.hour = clampHour(d.hour);
-      if (d.speed) { S.speed = d.speed; setRadio("#speed-toggle", "speed", d.speed); }
-      S.view = d.view;
-      setRadio("#view-toggle", "view", d.view);
-      map.paintScar();
-      drawLegend();
-      map.flyTo();
-      renderScopeAll({ animate: true });
-      S.moment = d.label;
-      d3.selectAll("#moments button").attr("aria-pressed", "false");
-      d3.select(this).attr("aria-pressed", "true");
-      document.getElementById("moment-caption").textContent = d.caption;
-      if (d.play && !REDUCED_MOTION) setTimeout(() => player.play(), 950);
-    });
-}
-
-function windowLabelFor([a, b]) {
-  return `${fmtDay(hourDate(a))} to ${fmtDay(hourDate(b - 1))}`;
 }
 
 /* ---------- URL hash ---------- */
@@ -1214,60 +725,26 @@ function writeHash() {
   clearTimeout(hashTimer);
   hashTimer = setTimeout(() => {
     const p = new URLSearchParams();
-    if (S.scope.type === "fire") p.set("f", S.scope.id);
-    if (S.scope.type === "region") p.set("r", S.scope.geo.flat().join(","));
-    if (S.window) p.set("w", S.window.join("-"));
+    if (S.fire) p.set("f", S.fire);
     p.set("h", S.hour);
     if (S.view !== "power") p.set("v", S.view);
-    if (S.measure !== "power") p.set("m", S.measure);
-    if (S.mode !== "filled") p.set("p", S.mode);
-    if (S.trail !== 6) p.set("t", S.trail);
     history.replaceState(null, "", `#${p}`);
   }, 250);
 }
 
 function readHash() {
   const p = new URLSearchParams(location.hash.slice(1));
-  const f = p.get("f");
-  if (f && runById(f)) S.scope = { type: "fire", id: f };
-  const r = (p.get("r") || "").split(",").map(Number);
-  if (r.length === 4 && r.every(Number.isFinite)) S.scope = { type: "region", geo: [[r[0], r[1]], [r[2], r[3]]] };
-  const w = (p.get("w") || "").split("-").map(Number);
-  if (w.length === 2 && w.every(Number.isInteger) && w[0] >= 0 && w[1] <= totalHours && w[1] - w[0] >= 2) S.window = w;
-  if (["power", "arrival", "duration"].includes(p.get("v"))) S.view = p.get("v");
-  if (MEASURES[p.get("m")]) S.measure = p.get("m");
-  if (p.get("p") === "reported") S.mode = "reported";
-  if (["0", "6", "24"].includes(p.get("t"))) S.trail = +p.get("t");
+  if (p.get("f") && runById(p.get("f"))) S.fire = p.get("f");
+  if (p.get("v") === "arrival") S.view = "arrival";
   const h = Number(p.get("h"));
-  if (p.has("h") && Number.isInteger(h) && h >= 0 && h < totalHours) S.hour = clampHour(h);
+  if (p.has("h") && Number.isInteger(h) && h >= 0 && h < totalHours) S.hour = h;
 }
 
 /* ---------- controls ---------- */
 
 function bindControls() {
   d3.selectAll("#view-toggle button").on("click", e => setView(e.currentTarget.dataset.view));
-  d3.selectAll("#measure-toggle button").on("click", e => setMeasure(e.currentTarget.dataset.measure));
-  d3.selectAll("#mode-toggle button").on("click", e => {
-    S.mode = e.currentTarget.dataset.mode;
-    setRadio("#mode-toggle", "mode", S.mode);
-    timeline.draw({ animate: true });
-    writeHash();
-  });
-  d3.selectAll("#trail-toggle button").on("click", e => {
-    S.trail = +e.currentTarget.dataset.trail;
-    setRadio("#trail-toggle", "trail", S.trail);
-    map.renderHour();
-    writeHash();
-  });
-  d3.selectAll("#speed-toggle button").on("click", e => {
-    S.speed = +e.currentTarget.dataset.speed;
-    setRadio("#speed-toggle", "speed", S.speed);
-  });
-  d3.select("#select-area").on("click", () => setSelecting(!S.selecting));
-  d3.select("#scope-clear").on("click", () => { clearMoment(); setScope({ type: "all" }); });
-  d3.select("#fire-sort").on("change", e => { S.sort = e.target.value; sortFireList(); });
-  d3.select("#win-busiest").on("click", () => { clearMoment(); setWindow(busiestWindow(scopeSeries())); });
-  d3.select("#win-reset").on("click", () => { clearMoment(); setWindow(null); });
+  d3.select("#scope-clear").on("click", () => setFire(null));
 
   document.addEventListener("keydown", event => {
     const tag = event.target.tagName;
@@ -1276,49 +753,41 @@ function bindControls() {
     if (event.key === " " && tag !== "BUTTON") { event.preventDefault(); player.toggle(); }
     else if (event.key === "ArrowRight") { event.preventDefault(); player.stop(); setHour(S.hour + step); }
     else if (event.key === "ArrowLeft") { event.preventDefault(); player.stop(); setHour(S.hour - step); }
-    else if (event.key === "Escape") {
-      if (S.selecting) setSelecting(false);
-      else if (S.scope.type !== "all") { clearMoment(); setScope({ type: "all" }); }
-    }
+    else if (event.key === "Escape" && S.fire) setFire(null);
     else if (event.key === "+" || event.key === "=") map.zoomBy(1.8);
     else if (event.key === "-") map.zoomBy(1 / 1.8);
-    else if (event.key === "1") setView("power");
-    else if (event.key === "2") setView("arrival");
-    else if (event.key === "3") setView("duration");
   });
 
   let resizeTimer;
   window.addEventListener("resize", () => {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
-      seriesCache.key = null;
       map.layout();
-      map.selectionChanged();
       timeline.draw();
-      tod.draw();
-      reach.draw();
     }, 150);
   });
 }
 
 function writeNotes() {
   const fmtLong = d3.utcFormat("%B %-d");
-  document.getElementById("period").textContent = `${fmtLong(new Date(meta.start))} and ${fmtLong(new Date(meta.end))}, ${meta.end.slice(0, 4)}`;
+  document.getElementById("period").textContent = `${fmtLong(new Date(meta.start))} to ${fmtLong(new Date(meta.end))}, ${meta.end.slice(0, 4)}`;
   document.getElementById("method-note").innerHTML =
-    `Data: NOAA ${meta.satellite} ${meta.product} fire detections, one scan every 5 minutes, ${meta.start} to ${meta.end}, inside the dashed study area. ` +
-    `${fmtInt(meta.scans)} scans gave ${fmtInt(meta.rawPixels)} fire pixels; ${fmtInt(meta.keptPixels)} remain after dropping pixels not seen again within two hours. ` +
-    `Times are local solar time (UTC + longitude / 15), about 1 h 20 min behind PDT at 120°W. ` +
-    `${fmtPct(meta.noFrpShare)} of fire pixels have no power value, mostly because of a daytime cloud flag; "gap-filled" gives each of those the mean power of measured pixels in the same half-degree cell and hour, and map colour only ever shows measured power. ` +
-    `Fire outlines and origins are NIFC final perimeters, used to name pixels and measure distance from origin; a pixel counts toward that distance once it lies within 6 km of the fire's connected footprint. ` +
+    `Data: NOAA ${meta.satellite} ${meta.product} fire detections, one scan every 5 minutes, ${meta.start} to ${meta.end}, inside the lit part of the map. ` +
+    `${fmtInt(meta.scans)} scans gave ${fmtInt(meta.rawPixels)} fire pixels; ${fmtInt(meta.keptPixels)} remain after dropping pixels not seen again within two hours, which are mostly false alarms. ` +
+    `Scans are averaged into hours of local solar time (UTC + longitude / 15), about 1 h 20 min behind PDT at 120°W. ` +
+    `"Heat" is fire radiative power. ${fmtPct(meta.noFrpShare)} of fire pixels have no power value, mostly because of a daytime cloud flag; the timeline gives each of those the mean power of measured pixels in the same half-degree cell and hour, and map colour only ever shows measured power. ` +
+    `At the regional scale pixels are drawn larger than life so they stay visible; zoom in for true footprints. ` +
+    `Fire names, origins and final outlines are NIFC perimeters for the nine largest fires with a single origin; distance from origin counts a pixel once it lies within 6 km of the fire's connected footprint. ` +
     `Smoke and cloud hide fire from the satellite, so a quiet hour is not always a calm one. ` +
+    `Basemap: NASA Blue Marble shaded relief, via GIBS. ` +
     `<a href="explore.html">See the six exploratory graphs that led to this design.</a>`;
 }
 
 async function init() {
   let raw, rawPixels;
   try {
-    [raw, rawPixels, states, context] = await Promise.all([
-      d3.json("data/fires.json"), d3.json("data/pixels.json"), d3.json("data/states.geojson"), d3.json("data/context.json"),
+    [raw, rawPixels, states] = await Promise.all([
+      d3.json("data/fires.json"), d3.json("data/pixels.json"), d3.json("data/states.geojson"),
     ]);
   } catch (err) {
     const p = document.createElement("p");
@@ -1330,11 +799,7 @@ async function init() {
   prepareData(raw);
   pixelData = preparePixels(rawPixels);
   indexPixels();
-  for (const d of context) {
-    d.geo = rewind(d.geometry);
-    const run = runs.find(r => r.name === d.name);
-    d.runId = run ? run.id : null;
-  }
+  // Open on the worst hour of the summer.
   S.hour = d3.greatest(seriesById.get("all").hours, d => d.filled).i;
   readHash();
   S.hour = clampHour(S.hour);
@@ -1343,22 +808,14 @@ async function init() {
   map = createMap();
   timeline = createTimeline();
   player = createPlayer();
-  tod = createTod();
-  reach = createReach();
-  buildFireList();
-  buildMoments();
   bindControls();
-
-  setRadio("#view-toggle", "view", S.view);
-  setRadio("#measure-toggle", "measure", S.measure);
-  setRadio("#mode-toggle", "mode", S.mode);
-  setRadio("#trail-toggle", "trail", S.trail);
-  document.getElementById("mode-toggle").hidden = S.measure !== "power";
-  d3.select("#trail-toggle").style("opacity", S.view === "power" ? null : 0.45);
+  d3.selectAll("#view-toggle button").attr("aria-checked", function () { return String(this.dataset.view === S.view); });
 
   drawLegend();
   map.layout();
-  renderScopeAll();
+  timeline.draw();
+  updateClock();
+  updateFireCard();
 }
 
 init();
